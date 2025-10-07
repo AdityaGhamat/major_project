@@ -1,5 +1,7 @@
+import MeetingSummarizerLanding from "./Pages/MeetingSummarizerLanding";
+
 const App = () => {
-  return <div>App</div>;
+  return <div><MeetingSummarizerLanding/></div>;
 };
 
 export default App;

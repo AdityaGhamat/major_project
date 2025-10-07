@@ -1,9 +1,9 @@
 import { createBrowserRouter } from "react-router";
 import App from "../../../App";
-
-export const routes = createBrowserRouter([
+import Home from "../../home/page/Home";
+export const router = createBrowserRouter([
   {
     index: true,
-    element: <App />,
+    element: <Home />,
   },
 ]);

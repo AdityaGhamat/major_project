@@ -12,6 +12,8 @@ import {
   BarChart3,
   Menu,
   X,
+  Settings,
+  Volume2,
 } from "lucide-react";
 
 const Home = () => {
@@ -27,27 +29,15 @@ const Home = () => {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [loginForm, setLoginForm] = useState({ email: "", password: "" });
   const [isLogin, setIsLogin] = useState(true);
-  const transcriptEndRef = useRef(null);
+  const [backendUrl, setBackendUrl] = useState("http://localhost:8000");
+  const [showSettings, setShowSettings] = useState(false);
+  const [recordingStatus, setRecordingStatus] = useState("");
+  const [audioSource, setAudioSource] = useState("both"); // 'mic', 'system', 'both'
 
-  useEffect(() => {
-    if (isRecording) {
-      const interval = setInterval(() => {
-        const sampleTranscripts = [
-          "Let's discuss the Q4 marketing strategy.",
-          "John will prepare the presentation by Friday.",
-          "We need to increase our social media engagement.",
-          "Sarah, please review the budget proposal.",
-          "The deadline for the project is December 15th.",
-        ];
-        const randomText =
-          sampleTranscripts[
-            Math.floor(Math.random() * sampleTranscripts.length)
-          ];
-        setTranscript((prev) => prev + " " + randomText);
-      }, 3000);
-      return () => clearInterval(interval);
-    }
-  }, [isRecording]);
+  const transcriptEndRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const streamRef = useRef(null);
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -78,61 +68,318 @@ const Home = () => {
     }
   };
 
-  const handleStartRecording = () => {
-    setIsRecording(true);
-    setTranscript("");
-    setSummary("");
-    setActionItems([]);
-    setSentiment(null);
-    setCurrentMeeting({
-      title: "New Meeting",
-      startTime: new Date(),
-    });
+  const getSupportedMimeType = () => {
+    const candidates = [
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/ogg;codecs=opus",
+      "audio/mp4",
+    ];
+    return (
+      candidates.find((t) => window.MediaRecorder?.isTypeSupported?.(t)) || ""
+    );
   };
 
-  const handleStopRecording = () => {
-    setIsRecording(false);
-    setTimeout(() => {
-      setSummary(
-        "The meeting focused on Q4 strategy, with emphasis on marketing initiatives and budget allocation. Key decisions were made regarding timeline and resource distribution. Team members were assigned specific tasks with clear deadlines."
+  const startRecording = async () => {
+    try {
+      setRecordingStatus("Requesting permissions...");
+      audioChunksRef.current = [];
+
+      let audioStream;
+      let audioContext; // hold reference so we can close it on stop
+
+      if (audioSource === "mic") {
+        // Microphone only
+        const micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+          },
+        });
+        if (!micStream.getAudioTracks().length) {
+          throw new Error("No microphone audio track available.");
+        }
+        audioStream = micStream;
+        setRecordingStatus("Recording from microphone");
+      } else if (audioSource === "system") {
+        // System audio only (requires getDisplayMedia)
+        try {
+          const sysStream = await navigator.mediaDevices.getDisplayMedia({
+            audio: true, // important: request audio as boolean
+            video: true, // many browsers require video to allow audio capture
+          });
+
+          // Stop video track if we only want audio
+          const videoTrack = sysStream.getVideoTracks()[0];
+          if (videoTrack) videoTrack.stop();
+
+          if (!sysStream.getAudioTracks().length) {
+            throw new Error(
+              "No system audio track. When sharing, pick a tab/window with sound and enable 'Share tab audio'."
+            );
+          }
+
+          audioStream = sysStream;
+          setRecordingStatus("Recording system audio");
+        } catch (err) {
+          alert(
+            "System audio capture needs screen-sharing permission. Select a tab/window and enable 'Share tab audio'."
+          );
+          throw err;
+        }
+      } else {
+        // Both microphone and system audio
+        try {
+          const micStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+            },
+          });
+
+          const systemStream = await navigator.mediaDevices.getDisplayMedia({
+            audio: true,
+            video: true,
+          });
+
+          // Stop video track (we only need audio)
+          const videoTrack = systemStream.getVideoTracks()[0];
+          if (videoTrack) videoTrack.stop();
+
+          // Mix only the sources that actually have audio tracks
+          audioContext = new (window.AudioContext ||
+            window.webkitAudioContext)();
+          const destination = audioContext.createMediaStreamDestination();
+
+          if (micStream.getAudioTracks().length) {
+            const micSource = audioContext.createMediaStreamSource(micStream);
+            micSource.connect(destination);
+          }
+          if (systemStream.getAudioTracks().length) {
+            const sysSource =
+              audioContext.createMediaStreamSource(systemStream);
+            sysSource.connect(destination);
+          }
+
+          audioStream = destination.stream;
+
+          if (!audioStream.getAudioTracks().length) {
+            throw new Error(
+              "No audio tracks found. Ensure mic access is granted and, for system audio, enable 'Share tab audio'."
+            );
+          }
+
+          setRecordingStatus("Recording microphone + system audio");
+        } catch (err) {
+          alert(
+            "Combined audio capture requires both microphone and screen-sharing permissions."
+          );
+          throw err;
+        }
+      }
+
+      // Save stream
+      streamRef.current = audioStream;
+
+      // Create MediaRecorder with a supported mime type
+      const mime = getSupportedMimeType();
+      const mediaRecorder = new MediaRecorder(
+        audioStream,
+        mime ? { mimeType: mime } : undefined
       );
+      mediaRecorderRef.current = mediaRecorder;
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
+        setRecordingStatus("Processing audio...");
+        const audioBlob = new Blob(audioChunksRef.current, {
+          type: mime || "audio/webm",
+        });
+        await sendAudioToBackend(audioBlob);
+
+        // Stop all tracks
+        if (streamRef.current) {
+          streamRef.current.getTracks().forEach((track) => track.stop());
+        }
+        // Close audio context if we created one
+        if (audioContext) {
+          try {
+            await audioContext.close();
+          } catch {}
+        }
+      };
+
+      // Start recording with chunks every 5 seconds for real-time transcription
+      mediaRecorder.start(5000);
+      setIsRecording(true);
+      setTranscript("");
+      setSummary("");
+      setActionItems([]);
+      setSentiment(null);
+      setCurrentMeeting({
+        title: "New Meeting",
+        startTime: new Date(),
+      });
+    } catch (error) {
+      console.error("Error starting recording:", error);
+      setRecordingStatus("Error: " + error.message);
+      alert("Failed to start recording: " + error.message);
+    }
+  };
+
+  const stopRecording = () => {
+    if (
+      mediaRecorderRef.current &&
+      mediaRecorderRef.current.state !== "inactive"
+    ) {
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
+      setRecordingStatus("Stopped");
+    }
+  };
+
+  const sendAudioToBackend = async (audioBlob) => {
+    try {
+      setRecordingStatus("Transcribing audio...");
+
+      const formData = new FormData();
+      // Keep .webm extension; most backends just need a file
+      formData.append("file", audioBlob, "recording.webm");
+
+      const response = await fetch(`${backendUrl}/transcribe`, {
+        method: "POST",
+        body: formData,
+      });
+
+      // Read body safely (JSON or text)
+      const contentType = response.headers.get("content-type") || "";
+      const rawBody = await (contentType.includes("application/json")
+        ? response.json()
+        : response.text());
+
+      if (!response.ok) {
+        const bodySnippet =
+          typeof rawBody === "string"
+            ? rawBody.slice(0, 400)
+            : JSON.stringify(rawBody).slice(0, 400);
+        throw new Error(
+          `HTTP ${response.status} ${response.statusText}. Response: ${bodySnippet}`
+        );
+      }
+
+      // Normalize data if server sent plain text by mistake
+      const data =
+        typeof rawBody === "string"
+          ? (() => {
+              try {
+                return JSON.parse(rawBody);
+              } catch {
+                return { transcript: rawBody }; // fallback: treat text as transcript
+              }
+            })()
+          : rawBody;
+
+      if (!data || typeof data.transcript !== "string") {
+        throw new Error(
+          `Unexpected response shape from /transcribe. Expected { transcript: string }. Got: ${
+            typeof rawBody === "string"
+              ? rawBody.slice(0, 400)
+              : JSON.stringify(rawBody).slice(0, 400)
+          }`
+        );
+      }
+
+      // ✅ Update transcript
+      setTranscript((prev) => `${prev ? prev + " " : ""}${data.transcript}`);
+
+      // Trigger summary/action extraction
+      setTimeout(() => {
+        generateSummaryAndActions(data.transcript);
+      }, 1000);
+
+      setRecordingStatus("Transcription complete");
+    } catch (error) {
+      console.error("Transcription error:", error);
+      setRecordingStatus("Error: " + error.message);
+      // Show the real error instead of the generic message
+      alert("Transcription failed: " + error.message);
+    }
+  };
+
+  const generateSummaryAndActions = (transcriptText) => {
+    // Generate summary
+    setSummary(
+      "The meeting covered key discussion points from the transcription. Important decisions were made and tasks were assigned to team members with specific deadlines."
+    );
+
+    // Extract potential action items (simple keyword-based extraction)
+    const actionKeywords = [
+      "will",
+      "should",
+      "need to",
+      "must",
+      "todo",
+      "action",
+    ];
+    const sentences = transcriptText.split(/[.!?]+/);
+    const detectedActions = [];
+
+    sentences.forEach((sentence, idx) => {
+      const lowerSentence = sentence.toLowerCase();
+      if (actionKeywords.some((keyword) => lowerSentence.includes(keyword))) {
+        detectedActions.push({
+          id: idx,
+          task: sentence.trim(),
+          deadline: "TBD",
+          assignee: "Team Member",
+        });
+      }
+    });
+
+    if (detectedActions.length > 0) {
+      setActionItems(detectedActions.slice(0, 5)); // Limit to 5 items
+    } else {
       setActionItems([
         {
           id: 1,
-          task: "John to prepare presentation",
-          deadline: "Friday",
-          assignee: "John",
-        },
-        {
-          id: 2,
-          task: "Sarah to review budget proposal",
+          task: "Follow up on meeting discussion",
           deadline: "Next Week",
-          assignee: "Sarah",
-        },
-        {
-          id: 3,
-          task: "Increase social media engagement",
-          deadline: "Ongoing",
-          assignee: "Marketing Team",
+          assignee: "Team",
         },
       ]);
-      setSentiment({ positive: 65, neutral: 25, negative: 10 });
+    }
 
-      const newMeeting = {
-        id: Date.now(),
-        title: currentMeeting.title,
-        date: currentMeeting.startTime.toISOString().split("T")[0],
-        duration:
-          Math.floor((new Date() - currentMeeting.startTime) / 60000) + " min",
-        summary:
-          "The meeting focused on Q4 strategy, with emphasis on marketing initiatives...",
-        actionItems: [
-          "John to prepare presentation",
-          "Sarah to review budget proposal",
-        ],
-      };
-      setMeetingHistory((prev) => [newMeeting, ...prev]);
-    }, 2000);
+    // Generate sentiment (random for demo)
+    setSentiment({
+      positive: 60 + Math.floor(Math.random() * 20),
+      neutral: 20 + Math.floor(Math.random() * 15),
+      negative: 5 + Math.floor(Math.random() * 10),
+    });
+
+    // Add to meeting history
+    const newMeeting = {
+      id: Date.now(),
+      title: currentMeeting.title,
+      date: currentMeeting.startTime.toISOString().split("T")[0],
+      duration:
+        Math.floor((new Date() - currentMeeting.startTime) / 60000) + " min",
+      summary: "Meeting transcribed and analyzed successfully.",
+      actionItems: detectedActions.slice(0, 3).map((a) => a.task),
+    };
+    setMeetingHistory((prev) => [newMeeting, ...prev]);
+  };
+
+  const handleStartRecording = () => {
+    startRecording();
+  };
+
+  const handleStopRecording = () => {
+    stopRecording();
   };
 
   const handleExportPDF = () => {
@@ -231,6 +478,12 @@ const Home = () => {
             </h1>
           </div>
           <div className="flex items-center space-x-4">
+            <button
+              onClick={() => setShowSettings(!showSettings)}
+              className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
+            >
+              <Settings className="w-5 h-5 text-gray-600" />
+            </button>
             <div className="hidden sm:flex items-center space-x-2 text-sm text-gray-600">
               <User className="w-4 h-4" />
               <span>{loginForm.email}</span>
@@ -245,6 +498,53 @@ const Home = () => {
           </div>
         </div>
       </header>
+
+      {showSettings && (
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+          <div className="bg-white rounded-xl shadow-sm p-6">
+            <h3 className="text-lg font-semibold text-gray-800 mb-4">
+              Settings
+            </h3>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Backend URL
+                </label>
+                <input
+                  type="text"
+                  className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none"
+                  placeholder="http://localhost:8000"
+                  value={backendUrl}
+                  onChange={(e) => setBackendUrl(e.target.value)}
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  Make sure your FastAPI backend is running
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Audio Source
+                </label>
+                <select
+                  className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none"
+                  value={audioSource}
+                  onChange={(e) => setAudioSource(e.target.value)}
+                >
+                  <option value="mic">Microphone Only</option>
+                  <option value="system">System Audio Only</option>
+                  <option value="both">Both (Microphone + System Audio)</option>
+                </select>
+                <p className="text-xs text-gray-500 mt-1">
+                  {audioSource === "system" || audioSource === "both"
+                    ? "⚠️ System audio requires screen sharing permission"
+                    : "🎤 Records from your microphone"}
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="flex max-w-7xl mx-auto">
         <aside
@@ -326,7 +626,26 @@ const Home = () => {
                   )}
                 </div>
 
-                <div className="flex items-center justify-center py-8">
+                <div className="flex flex-col items-center justify-center py-8 space-y-4">
+                  <div className="flex items-center space-x-2 text-sm text-gray-600 mb-2">
+                    {audioSource === "mic" && <Mic className="w-4 h-4" />}
+                    {audioSource === "system" && (
+                      <Volume2 className="w-4 h-4" />
+                    )}
+                    {audioSource === "both" && (
+                      <>
+                        <Mic className="w-4 h-4" />
+                        <span>+</span>
+                        <Volume2 className="w-4 h-4" />
+                      </>
+                    )}
+                    <span>
+                      {audioSource === "mic" && "Microphone"}
+                      {audioSource === "system" && "System Audio"}
+                      {audioSource === "both" && "Mic + System Audio"}
+                    </span>
+                  </div>
+
                   <button
                     onClick={
                       isRecording ? handleStopRecording : handleStartRecording
@@ -349,6 +668,12 @@ const Home = () => {
                       </>
                     )}
                   </button>
+
+                  {recordingStatus && (
+                    <div className="text-sm text-gray-600 mt-2">
+                      {recordingStatus}
+                    </div>
+                  )}
                 </div>
 
                 {isRecording && currentMeeting && (

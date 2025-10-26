@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "AI Meeting Recorder",
+  "description": "Captures meeting audio and sends it to Whisper for transcription",
+  "version": "1.0",
+  "permissions": ["tabCapture", "activeTab", "storage", "background"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "host_permissions": ["http://localhost:8000/*"]
+}
